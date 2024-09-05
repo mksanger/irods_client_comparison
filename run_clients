@@ -1,0 +1,169 @@
+#! /usr/bin/env bash
+
+zone="testZone"
+irods_user="irods"
+other_group="test_group"
+
+
+source_dir="$PWD/test_files"
+put_over="$PWD/put_over" 
+get_dir="$PWD/test_files_get"
+get_over="$PWD/get_over"
+
+usage(){
+  cat 1>&2 <<EOF
+This script runs our most frequently used clients on each of a set of files in 
+the provided source directory.
+
+It currently runs those client from: 
+icommands - https://github.com/irods/irods_client_icommands, 
+gocommands - https://github.com/cyverse/gocommands (with some exceptions), 
+baton - https://github.com/wtsi-npg/baton,
+go-baton - https://github.com/mksanger/go-baton (a simple implementation of some
+           as yet unimplemented go-irodsclient api (and some since implemented)).
+
+Usage: $(basename "$0")
+    [-h]             Display this help message and exit
+    [-s source]      The directory containing files to run the clients on 
+                     (Default: $(PWD)/test_files)
+    [-d destination] The iRODS collection in which to operate
+                     (Default: /[zone]/home/[irods user]/client_test
+    [-p put over]    Used to test the behaviour when putting to a path that 
+                     already has an object present 
+                     (Default: $(PWD)/put_over)
+    [-g get over]    Used to test the behaviour when getting to a path that 
+                     already has a file present 
+                     (Default: $(PWD)/get_over)
+    [-u irods user]  iRODS user name under which to run, should be authenticated
+                     before running this script
+                     (Default: irods)
+    [-z zone]        iRODS zone
+                     (Default: testZone)
+EOF
+}
+
+while getopts "hs:p:g:u:z:" option; do
+  case "$option" in 
+  h)
+    usage
+    exit 0
+    ;;
+  s)
+    source_dir="$OPTARG"
+    ;;
+  d)
+    dest_coll="$OPTARG"
+    ;;
+  p)
+    put_over="$OPTARG"
+    ;;
+  g)
+    get_over="$OPTARG"
+    ;;
+  u)
+    irods_user="$OPTARG"
+    ;;
+  z)
+    zone="$OPTARG"
+    ;;
+  esac
+done
+
+if [[ $dest_coll == "" ]]; then
+  dest_coll="/$zone/home/$irods_user/client_test"
+fi
+
+set -o xtrace
+
+icommands_style_test(){ #$1=collection $2=put $3=get $4=meta add $5=meta ls $6=meta rm $7=meta query $8=chmod
+  echo $1
+  coll="$1"
+  imkdir -p "$dest_coll/$1/"
+  mkdir -p "$get_dir/$1"
+
+  start=$SECONDS
+  for file in $(ls $put_dir)
+  do
+    obj_path="$base_coll/$1/$file"
+    time $2 -k "$put_dir/$file" "$obj_path"
+    time $4 "$obj_path" time_added "$(date)"
+    time $4 "$obj_path" file_name $file
+    time $3 "$obj_path" "$get_dir/$coll/$file"
+    diff "$put_dir/$file" "$get_dir/$coll/$file"
+    time $5 "$obj_path"
+    if [ "$7" != "" ] #gocommands has no entrypoint to query metadata
+    then
+      time $7 -z $zone -d file_name like "%"
+    fi
+    time $6 "$obj_path" file_name $file
+    if [ "$8" != "" ] #gocommands has no entrypoint to interact with permissions
+    then
+      time $8 own $other_group "$obj_path"
+    fi
+  done
+
+  echo "PUT/GET OVER" # for gocmd these interrupt and ask whether to force overwrite
+  time echo 'n' | $2 -k "$put_over" "$obj_path" 
+  time echo 'n' | $3 "$obj_path" "$get_over"
+
+  echo "Total time for $1 $(($SECONDS - $start))"
+}
+
+make_put_get_json() {
+  put_get_json="{coll: \"$base_coll/$1\", obj: \"$2\", dir:\"$3\", file: \"$4\"}"  
+}
+
+make_metamod_json() {
+  metamod_json="{coll:\"$base_coll/$1\", obj: \"$2\", avus: [{attribute: \"$3\", value: \"$4\"}]}"
+}
+
+make_metaquery_json() {
+  metaquery_json="{avus: [{attribute: \"$1\", operator: \"like\", value: \"%\"}]}"
+}
+
+make_chmod_json() {
+  chmod_json="{coll: \"$base_coll/$1\", obj: \"$2\", access: [{owner: \"$other_group\", level: \"own\"}]}"
+}
+
+baton_style_test(){ # $1=collection $2=put $3=get $4=metamod $5=metaquery $6=list $7=chmod
+  echo $1
+  coll="$1"
+  imkdir -p "$base_coll/$1"
+  mkdir -p "$get_dir/$1"
+  start=$SECONDS
+  for file in $(ls $put_dir)
+  do
+    make_put_get_json $1 $file $put_dir $file
+    time jq -n "$put_get_json" | $2 --checksum
+    make_metamod_json $1 $file time_added $(date)
+    time jq -n "$metamod_json" | $4 --operation add
+    make_metamod_json $1 $file file_name $file
+    time jq -n "$metamod_json" | $4 --operation add
+    make_put_get_json $1 $file "$get_dir/$coll" $file
+    time jq -n "$put_get_json" | $3
+    diff "$put_dir/$file" "$get_dir/$coll/$file"
+    time jq -n "$put_get_json" | $6 --avu # list will ignore the extra terms
+    make_metaquery_json file_name
+    time jq -n "$metaquery_json" | $5 --zone $zone
+    make_metamod_json $1 $file file_name $file
+    time jq -n "$metamod_json" | $4 --operation rem
+    make_chmod_json $1 $file
+    time jq -n "$chmod_json" | $7
+  done
+
+  echo "PUT/GET OVER"
+  make_put_get_json $1 $file $PWD $put_over
+  time jq -n "$put_get_json" | $2 --checksum
+  make_put_get_json $1 $file $PWD $get_over
+  time jq -n "$put_get_json" | $3
+
+  echo "Total time for $1 $(($SECONDS - $start))"
+}
+
+irm -r $base_coll
+rm -r $get_dir
+icommands_style_test icommands iput iget "imeta add -d" "imeta ls -d" "imeta rm -d" "imeta qu" "ichmod"
+icommands_style_test gocommands "gocmd put --thread_num 1" "gocmd get --thread_num 1" "gocmd addmeta --path" "gocmd lsmeta --path" "gocmd rmmeta --path"
+baton_style_test baton baton-put baton-get baton-metamod baton-metaquery baton-list baton-chmod
+baton_style_test go_baton "go-baton put" "go-baton get" "go-baton metamod" "go-baton metaquery" "echo" "go-baton chmod"
+
